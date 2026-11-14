@@ -47,6 +47,96 @@ enum SelfTests {
         }
 
         do {
+            let left: CGEventFlags = [.maskControl, CGEventFlags(rawValue: 0x1)]
+            let right: CGEventFlags = [.maskControl, CGEventFlags(rawValue: 0x2000)]
+            check(ControlModifierState.isDown(keyCode: 59, flags: left), true, "left modifier down")
+            check(ControlModifierState.isDown(keyCode: 59, flags: right), false, "right held does not keep left down")
+            check(ControlModifierState.isDown(keyCode: 62, flags: right), true, "right modifier down")
+            check(ControlModifierState.isDown(keyCode: 62, flags: left), false, "left held does not keep right down")
+
+            var recovery = ControlReleaseRecovery()
+            let now = Date()
+            check(recovery.shouldRecover(phase: .dictating, keyIsDown: false, now: now), false, "release first observed")
+            check(recovery.shouldRecover(phase: .dictating, keyIsDown: false, now: now.addingTimeInterval(0.05)), false, "release debounce")
+            check(recovery.shouldRecover(phase: .dictating, keyIsDown: true, now: now.addingTimeInterval(0.06)), false, "held key clears recovery")
+            check(recovery.shouldRecover(phase: .dictating, keyIsDown: false, now: now.addingTimeInterval(0.2)), false, "release restarts debounce")
+            check(recovery.shouldRecover(phase: .dictating, keyIsDown: false, now: now.addingTimeInterval(0.31)), true, "missing release recovers")
+            check(recovery.shouldRecover(phase: .idle, keyIsDown: false, now: now.addingTimeInterval(1)), false, "idle cannot release again")
+        }
+
+        do {
+            // Replay successive holds through the real monitor without installing
+            // a tap, recording audio, posting keyboard events, or activating apps.
+            var leftIsDown = false
+            var began = 0
+            var released = 0
+            var cancelled = 0
+            var posted: [Bool] = []
+            let target = UURemoteTarget(application: .current)
+            let monitor = ControlHoldMonitor(
+                holdThreshold: 0.18,
+                targetProvider: { target },
+                localComposerReady: { true },
+                onBegin: { _ in began += 1 },
+                onRelease: { released += 1 },
+                onCancel: { cancelled += 1 },
+                physicalKeyState: { $0 == 59 && leftIsDown },
+                controlEventPoster: { down, _ in posted.append(down); return true }
+            )
+
+            func beginHold() {
+                leftIsDown = true
+                guard let down = ControlHoldMonitor.makeControlEvent(down: true, rightControlHeld: false) else {
+                    failures.append("Unable to construct test Control down")
+                    return
+                }
+                let previousCount = posted.count
+                _ = monitor.handleControlFlagsChanged(down)
+                let deadline = Date().addingTimeInterval(1)
+                while posted.count == previousCount && Date() < deadline {
+                    RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+                }
+                RunLoop.current.run(until: Date().addingTimeInterval(0.17))
+                check(monitor.isGestureIdle, false, "hold active before release")
+            }
+
+            beginHold()
+            leftIsDown = false // The input method swallows the flagsChanged up.
+            let firstRelease = Date()
+            monitor.reconcilePhysicalControlState(now: firstRelease)
+            monitor.reconcilePhysicalControlState(now: firstRelease.addingTimeInterval(0.11))
+            check(monitor.isGestureIdle, true, "missing release returns monitor to idle")
+            check(released, 1, "missing release finishes exactly once")
+            monitor.reconcilePhysicalControlState(now: firstRelease.addingTimeInterval(1))
+            check(released, 1, "repeated polling cannot finish twice")
+
+            beginHold()
+            leftIsDown = false
+            guard let up = ControlHoldMonitor.makeControlEvent(down: false, rightControlHeld: false) else {
+                failures.append("Unable to construct test Control up")
+                return false
+            }
+            _ = monitor.handleControlFlagsChanged(up)
+            _ = monitor.handleControlFlagsChanged(up) // Duplicate up must not look like a new down.
+            check(monitor.isGestureIdle, true, "second hold and duplicate release return idle")
+            check(released, 2, "second hold finishes normally")
+
+            beginHold()
+            monitor.finishSessionGesture() // Return/Esc/timeout before the monitor receives up.
+            check(monitor.isGestureIdle, true, "session completion clears held gesture")
+            leftIsDown = false
+            _ = monitor.handleControlFlagsChanged(up)
+            beginHold()
+            leftIsDown = false
+            _ = monitor.handleControlFlagsChanged(up)
+            check(began, 4, "four successive holds open without restart")
+            check(released, 3, "session cleanup does not emit a second completion")
+            check(cancelled, 0, "release recovery preserves the transcript")
+            check(posted, [true, false, true, false, true, false, true, false], "all synthetic downs have matching ups")
+            monitor.stop()
+        }
+
+        do {
             let flagsMask = CGEventMask(1) << CGEventMask(CGEventType.flagsChanged.rawValue)
             let uu = InstalledEventTap(
                 processIdentifier: 100,
@@ -287,7 +377,7 @@ enum SelfTests {
         }
 
         if failures.isEmpty {
-            print("SELF_TEST_OK groups=12 (voice regression + image focus/clipboard guards)")
+            print("SELF_TEST_OK groups=14 (missing-release replay + repeated holds + voice/image guards)")
             return true
         }
         for failure in failures {

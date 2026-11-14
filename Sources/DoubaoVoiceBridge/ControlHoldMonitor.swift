@@ -20,6 +20,8 @@ final class ControlHoldMonitor {
     private let onBegin: (UURemoteTarget) -> Void
     private let onRelease: () -> Void
     private let onCancel: () -> Void
+    private let physicalKeyState: (CGKeyCode) -> Bool
+    private let controlEventPoster: ((Bool, SyntheticControlRoute) -> Bool)?
     private let logger = Logger(subsystem: "com.lyp.DoubaoVoiceBridge", category: "control")
 
     private var gesture = HoldGestureState()
@@ -35,6 +37,8 @@ final class ControlHoldMonitor {
     private var physicalRightControlIsDown = false
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
+    private var releaseRecovery = ControlReleaseRecovery()
+    private var recoveryTimer: Timer?
     private(set) var activeTapLocation: CGEventTapLocation?
     var isGestureIdle: Bool { gesture.phase == .idle }
 
@@ -44,7 +48,11 @@ final class ControlHoldMonitor {
         localComposerReady: @escaping () -> Bool,
         onBegin: @escaping (UURemoteTarget) -> Void,
         onRelease: @escaping () -> Void,
-        onCancel: @escaping () -> Void
+        onCancel: @escaping () -> Void,
+        physicalKeyState: @escaping (CGKeyCode) -> Bool = {
+            CGEventSource.keyState(.hidSystemState, key: $0)
+        },
+        controlEventPoster: ((Bool, SyntheticControlRoute) -> Bool)? = nil
     ) {
         self.holdThreshold = min(max(holdThreshold, 0.18), 0.60)
         self.targetProvider = targetProvider
@@ -52,6 +60,8 @@ final class ControlHoldMonitor {
         self.onBegin = onBegin
         self.onRelease = onRelease
         self.onCancel = onCancel
+        self.physicalKeyState = physicalKeyState
+        self.controlEventPoster = controlEventPoster
     }
 
     deinit {
@@ -97,15 +107,21 @@ final class ControlHoldMonitor {
 
         eventTap = tap
         activeTapLocation = .cghidEventTap
-        physicalLeftControlIsDown = CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(Self.leftControlKeyCode))
-        physicalRightControlIsDown = CGEventSource.keyState(.combinedSessionState, key: 62)
+        synchronizePhysicalKeys()
         runLoopSource = source
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
+        let timer = Timer(timeInterval: ControlReleaseRecovery.pollingInterval, repeats: true) { [weak self] _ in
+            self?.reconcilePhysicalControlState()
+        }
+        recoveryTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
         logger.notice("HID event tap started at head")
     }
 
     func stop() {
+        recoveryTimer?.invalidate()
+        recoveryTimer = nil
         resetGesture(notifyCancel: true)
         if let source = runLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
@@ -118,13 +134,44 @@ final class ControlHoldMonitor {
         activeTapLocation = nil
     }
 
+    // Session completion can arrive through the panel (Return/Esc/timeout),
+    // even when an input method has swallowed the physical Control release.
+    func finishSessionGesture() {
+        resetGesture(notifyCancel: false)
+        synchronizePhysicalKeys()
+    }
+
+    private func synchronizePhysicalKeys() {
+        physicalLeftControlIsDown = physicalKeyState(CGKeyCode(Self.leftControlKeyCode))
+        physicalRightControlIsDown = physicalKeyState(62)
+    }
+
+    func reconcilePhysicalControlState(now: Date = Date()) {
+        let leftIsDown = physicalKeyState(CGKeyCode(Self.leftControlKeyCode))
+        physicalRightControlIsDown = physicalKeyState(62)
+        if gesture.phase == .idle {
+            physicalLeftControlIsDown = leftIsDown
+        }
+        guard releaseRecovery.shouldRecover(phase: gesture.phase, keyIsDown: leftIsDown, now: now) else { return }
+        logger.notice("Recovering missing physical left Control release")
+        physicalLeftControlIsDown = false
+        switch gesture.phase {
+        case .dictating:
+            finishDictationGesture()
+        case .pending, .passthrough:
+            // resetGesture also balances any Control down forwarded for a chord.
+            resetGesture(notifyCancel: false)
+        case .idle:
+            break
+        }
+    }
+
     private func handle(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             logger.error("HID event tap disabled; re-enabling (reason=\(type.rawValue, privacy: .public))")
             if let eventTap { CGEvent.tapEnable(tap: eventTap, enable: true) }
             resetGesture(notifyCancel: true)
-            physicalLeftControlIsDown = CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(Self.leftControlKeyCode))
-            physicalRightControlIsDown = CGEventSource.keyState(.combinedSessionState, key: 62)
+            synchronizePhysicalKeys()
             return Unmanaged.passUnretained(event)
         }
 
@@ -133,8 +180,24 @@ final class ControlHoldMonitor {
         }
 
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-        if type == .flagsChanged, keyCode == 62 {
-            physicalRightControlIsDown.toggle()
+        if type == .flagsChanged, keyCode == 62 || keyCode == Self.leftControlKeyCode {
+            return handleControlFlagsChanged(event)
+        }
+
+        switch gesture.phase {
+        case .pending:
+            logger.notice("Control hold became a chord; restoring remote Control passthrough")
+            beginPassthroughForChord(proxy: proxy)
+        case .idle, .dictating, .passthrough:
+            break
+        }
+        return Unmanaged.passUnretained(event)
+    }
+
+    func handleControlFlagsChanged(_ event: CGEvent) -> Unmanaged<CGEvent>? {
+        let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+        if keyCode == 62 {
+            physicalRightControlIsDown = ControlModifierState.isDown(keyCode: keyCode, flags: event.flags)
             if gesture.phase == .pending {
                 beginPassthroughForChord()
             } else if gesture.phase == .dictating {
@@ -143,8 +206,8 @@ final class ControlHoldMonitor {
             }
             return Unmanaged.passUnretained(event)
         }
-        if type == .flagsChanged, keyCode == Self.leftControlKeyCode {
-            physicalLeftControlIsDown.toggle()
+        if keyCode == Self.leftControlKeyCode {
+            physicalLeftControlIsDown = ControlModifierState.isDown(keyCode: keyCode, flags: event.flags)
             let isDown = physicalLeftControlIsDown
             if isDown, case .idle = gesture.phase {
                 let conflictingFlags: CGEventFlags = [.maskShift, .maskAlternate, .maskCommand, .maskSecondaryFn]
@@ -155,13 +218,6 @@ final class ControlHoldMonitor {
             return handleLeftControl(isDown: isDown, event: event)
         }
 
-        switch gesture.phase {
-        case .pending:
-            logger.notice("Control hold became a chord; restoring remote Control passthrough")
-            beginPassthroughForChord(proxy: proxy)
-        case .idle, .dictating, .passthrough:
-            break
-        }
         return Unmanaged.passUnretained(event)
     }
 
@@ -176,6 +232,7 @@ final class ControlHoldMonitor {
             }
 
             logger.notice("Physical left Control down intercepted for local dictation")
+            releaseRecovery.reset()
             self.target = target
             _ = gesture.handle(.controlDown(targetAvailable: true))
             let workItem = DispatchWorkItem { [weak self] in self?.activateDictationIfStillPending() }
@@ -310,6 +367,7 @@ final class ControlHoldMonitor {
         syntheticRoute = nil
         localFocusDeadline = nil
         releaseRequestedBeforeSyntheticDown = false
+        releaseRecovery.reset()
         gesture.reset()
         target = nil
         if notifyCancel && wasDictating { onCancel() }
@@ -333,6 +391,7 @@ final class ControlHoldMonitor {
         route: SyntheticControlRoute,
         proxy: CGEventTapProxy? = nil
     ) -> Bool {
+        if let controlEventPoster { return controlEventPoster(down, route) }
         guard let event = Self.makeControlEvent(
             down: down, rightControlHeld: physicalRightControlIsDown
         ) else { return false }

@@ -75,6 +75,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onCancel: { [weak self] in self?.coordinator.cancel() }
         )
         self.monitor = monitor
+        coordinator.onGestureFinished = { [weak self] in
+            self?.monitor?.finishSessionGesture()
+            self?.scheduleTapOrderAudit(after: 0.1)
+        }
         observeUURemoteLifecycle()
         observeEventTapChanges()
         startMonitorOrRequestPermissions(promptIfNeeded: true)

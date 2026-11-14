@@ -8,9 +8,22 @@
 
 > 本项目是非官方的个人自动化工具，与豆包、字节跳动、UU 远控或网易没有隶属、合作或授权关系。相关名称与商标归各自权利人所有。
 
+## 此 fork 的修复
+
+本仓库 fork 自 [yupeng316888-create/DoubaoVoiceBridge](https://github.com/yupeng316888-create/DoubaoVoiceBridge)，保留原作者的 MIT 许可。当前 fork 版本为 **2.4.2（build 9）**。
+
+修复左 Control 在首次听写后无法再次唤起的问题：输入法可能先拦截松键事件，使工具一直保留上一轮的按下状态，并阻塞空闲时的监听顺序修复。
+
+- 每 50 毫秒检查 Control 的 HID 实际按键状态；持续松开 100 毫秒但没收到事件时，补齐这一轮的结束流程。
+- 提交、取消、识别超时和输入框收到松键事件时，同时清理监听器的状态与合成按键。
+- 按事件的左右 Control 标志判断按下／松开，避免漏事件、重复事件使内部状态反转。
+- 不增加权限，不保存听写原文；原有截图和剪贴板保护继续生效。
+
+2026-11-14：缺失松键事件、连续四轮唤起、重复松键与会话结束清理的回放测试通过；禁用恢复逻辑时，回归测试失败。真实麦克风与远端编辑器的连续使用仍需在本机实测，自动测试结果不代表设备验收。
+
 ## 下载与安装
 
-在 [Releases](https://github.com/yupeng316888-create/DoubaoVoiceBridge/releases) 下载应用压缩包，解压后将“远控听写.app”放入“应用程序”目录，再打开。
+此 fork 可按下文从源码构建，产物位于 `dist/远控听写.app`。原作者的 v2.4.1 压缩包仍可在[上游 Releases](https://github.com/yupeng316888-create/DoubaoVoiceBridge/releases) 下载，但不包含上述修复。
 
 v2.4.1 提供包含 Apple Silicon 和 Intel 架构的通用应用。当前真实远控验收在 Apple Silicon Mac mini 上完成；Intel 已完成构建验证，尚未在 Intel 硬件上实测。应用采用 ad-hoc 签名，未使用 Apple Developer ID 签名，也未经过公证。
 
@@ -79,13 +92,13 @@ UU 通过 Bundle ID `com.netease.uuremote` 识别。应用标识、输入法快�
 需要 Xcode Command Line Tools 和 Swift 5.9 或更高版本。
 
 ```bash
-git clone https://github.com/yupeng316888-create/DoubaoVoiceBridge.git
+git clone https://github.com/Shevckcccc/DoubaoVoiceBridge.git
 cd DoubaoVoiceBridge
 ./scripts/build-app.sh
 open dist
 ```
 
-构建脚本分别编译 Intel 与 Apple Silicon，再生成通用二进制 `dist/远控听写.app`，进行 ad-hoc 签名、严格签名检查、自检和诊断。
+构建脚本明确使用 SwiftPM native 后端，分别编译 Intel 与 Apple Silicon，再生成通用二进制 `dist/远控听写.app`，进行 ad-hoc 签名、严格签名检查、自检和诊断。
 
 ## 测试与验证范围
 
@@ -94,7 +107,7 @@ swift run DoubaoVoiceBridge --self-test
 swift run DoubaoVoiceBridge --diagnostics
 ```
 
-内置自检覆盖长按判定、输入法事件路由与监听顺序、识别稳定等待、完整粘贴按键序列、延迟配置、听写框布局，以及图片传送的窗口／剪贴板变化保护。
+内置自检覆盖长按判定、输入法事件路由与监听顺序、识别稳定等待、完整粘贴按键序列、延迟配置、听写框布局，以及图片传送的窗口／剪贴板变化保护。fork 新增的回放测试直接使用生产监听器，注入按键状态和事件发送替身，不安装监听、不录音、不发送真实按键，也不切换应用。
 
 v2.4.1 已由维护者在两台 Mac mini 的 UU 连接中实际验证：左 Control 语音输入、本机框选截图、远端图片自动进入输入框且不发送。不同网络、所有远端编辑器、Intel 硬件及多个远控窗口组合未全部实测。测试通过不代表每次远端接收均有自动回执。
 

@@ -10,6 +10,7 @@ final class SessionCoordinator {
     }
 
     var onStatusChange: ((String, Bool) -> Void)?
+    var onGestureFinished: (() -> Void)?
 
     private let panel = ComposerPanelController()
     private let delivery = UURemoteDelivery()
@@ -46,6 +47,7 @@ final class SessionCoordinator {
     func controlReleased() {
         guard state == .listening else { return }
         state = .finalizing
+        onGestureFinished?()
         panel.waitForFinalTranscript()
         onStatusChange?("正在完成识别…", false)
     }
@@ -55,6 +57,7 @@ final class SessionCoordinator {
         let target = self.target
         self.target = nil
         state = .idle
+        onGestureFinished?()
         panel.hide()
         target?.activateOriginalWindow()
         onStatusChange?("就绪 · 在 UU 远控中长按左 ⌃", false)
@@ -69,6 +72,7 @@ final class SessionCoordinator {
         guard state == .listening || state == .finalizing || state == .failed,
               let target else { return }
         state = .delivering
+        onGestureFinished?()
         deliveryAwaitingCleanup = true
         panel.showSending()
         onStatusChange?("正在同步并自动粘贴…", false)
@@ -104,6 +108,7 @@ final class SessionCoordinator {
 
     private func handleTranscriptTimeout() {
         state = .failed
+        onGestureFinished?()
         if panel.currentText().isEmpty {
             panel.showError("没有识别到文字。按 Esc 返回 UU 后可重试")
             onStatusChange?("没有识别到文字，请重试", true)

@@ -4,8 +4,10 @@ set -euo pipefail
 project_root="${0:A:h:h}"
 cd "$project_root"
 
-swift build -c release --arch x86_64 -j 2
-swift build -c release --arch arm64 -j 2
+# Keep the architecture-specific output paths below on toolchains whose default
+# changed to swiftbuild (which shares one Products/Release directory).
+swift build --build-system native -c release --arch x86_64 -j 2
+swift build --build-system native -c release --arch arm64 -j 2
 
 stage_root="$(mktemp -d "${TMPDIR:-/tmp}/doubao-voice-bridge.XXXXXX")"
 trap 'rm -rf "$stage_root"' EXIT
