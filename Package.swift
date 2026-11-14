@@ -16,7 +16,8 @@ let package = Package(
             path: "Sources/DoubaoVoiceBridge",
             linkerSettings: [
                 .linkedFramework("AppKit"),
-                .linkedFramework("ApplicationServices")
+                .linkedFramework("ApplicationServices"),
+                .linkedFramework("IOKit")
             ]
         )
     ]

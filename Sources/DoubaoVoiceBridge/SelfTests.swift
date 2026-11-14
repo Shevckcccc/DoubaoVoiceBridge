@@ -137,6 +137,81 @@ enum SelfTests {
         }
 
         do {
+            // A suppressed Quartz down can read back as up. An unavailable
+            // hardware observer must not cancel a hold before the threshold.
+            var began = 0
+            var released = 0
+            let target = UURemoteTarget(application: .current)
+            let monitor = ControlHoldMonitor(holdThreshold: 0.18,
+                targetProvider: { target }, localComposerReady: { true },
+                onBegin: { _ in began += 1 }, onRelease: { released += 1 },
+                onCancel: {}, physicalKeyState: { _ in nil },
+                controlEventPoster: { _, _ in true })
+            if let down = ControlHoldMonitor.makeControlEvent(down: true, rightControlHeld: false),
+               let up = ControlHoldMonitor.makeControlEvent(down: false, rightControlHeld: false) {
+                _ = monitor.handleControlFlagsChanged(down)
+                monitor.reconcilePhysicalControlState()
+                monitor.reconcilePhysicalControlState(now: Date().addingTimeInterval(0.15))
+                RunLoop.current.run(until: Date().addingTimeInterval(0.42))
+                monitor.reconcilePhysicalControlState(now: Date().addingTimeInterval(1))
+                check(began, 1, "unknown hardware state preserves long-press threshold")
+                check(monitor.isGestureIdle, false, "unknown hardware state cannot manufacture release")
+                _ = monitor.handleControlFlagsChanged(up)
+                check(released, 1, "event release still works without hardware observer")
+            } else { failures.append("Unable to construct unknown-hardware test events") }
+            monitor.stop()
+        }
+
+        do {
+            // Drive the actual coordinator with delayed delivery callbacks. No
+            // real clipboard writes, keyboard posts, windows, or focus changes.
+            let panel = TestDictationComposer()
+            let delivery = TestTranscriptDelivery()
+            let coordinator = SessionCoordinator(panel: panel, delivery: delivery, activateTarget: { _ in })
+            let first = UURemoteTarget(application: .current)
+            let second = UURemoteTarget(application: .current)
+            coordinator.begin(target: first)
+            panel.onCommit?("test one")
+            check(coordinator.canBegin, false, "cannot listen while Command-V is in flight")
+            delivery.requests[0].completion(.success(()))
+            check(coordinator.canBegin, true, "paste success immediately permits next hold")
+            check(coordinator.isClipboardBusy, true, "restore remains pending after paste")
+            coordinator.begin(target: second)
+            delivery.requests[0].cleanup()
+            check(coordinator.state, .listening, "old cleanup cannot erase new listening session")
+            coordinator.controlReleased()
+            panel.onCommit?("test two")
+            delivery.requests[1].completion(.success(()))
+            coordinator.begin(target: first)
+            coordinator.controlReleased()
+            panel.onCommit?("test three")
+            check(coordinator.state, .waitingForClipboard, "fast transcript waits in memory")
+            check(delivery.requests.count, 2, "clipboard writes never overlap")
+            delivery.requests[1].cleanup()
+            check(delivery.requests.count, 3, "queued transcript drains after restore")
+            check(delivery.requests[2].text, "test three", "queued transcript survives intact")
+            check(delivery.requests[2].target === first, true, "queued transcript retains its own target")
+            delivery.requests[2].completion(.success(()))
+            coordinator.begin(target: second)
+            panel.onCommit?("cancelled test")
+            coordinator.cancel()
+            delivery.requests[2].cleanup()
+            check(delivery.requests.count, 3, "cancelled queued transcript is never delivered")
+            check(coordinator.state, .idle, "cancelled queue returns idle")
+            coordinator.begin(target: second)
+            panel.onCommit?("retry test")
+            delivery.requests[3].completion(.failure(DeliveryError.targetChanged))
+            check(coordinator.state, .failed, "delivery failure preserves retry state")
+            delivery.requests[3].cleanup()
+            check(coordinator.state, .failed, "cleanup cannot erase delivery failure")
+            panel.onCommit?("retry test")
+            check(delivery.requests.count, 5, "failed delivery can retry")
+            delivery.requests[4].completion(.success(()))
+            delivery.requests[4].cleanup()
+            check(coordinator.isClipboardBusy, false, "final cleanup releases clipboard ownership")
+        }
+
+        do {
             let flagsMask = CGEventMask(1) << CGEventMask(CGEventType.flagsChanged.rawValue)
             let uu = InstalledEventTap(
                 processIdentifier: 100,
@@ -377,7 +452,7 @@ enum SelfTests {
         }
 
         if failures.isEmpty {
-            print("SELF_TEST_OK groups=14 (missing-release replay + repeated holds + voice/image guards)")
+            print("SELF_TEST_OK groups=16 (repeated holds + unknown hardware + consecutive delivery + voice/image guards)")
             return true
         }
         for failure in failures {
@@ -385,4 +460,37 @@ enum SelfTests {
         }
         return false
     }
+}
+
+private final class TestDictationComposer: DictationComposer {
+    var onCommit: ((String) -> Void)?
+    var onCancel: (() -> Void)?
+    var onControlReleased: (() -> Void)?
+    var onTranscriptTimeout: (() -> Void)?
+    var isReadyForLocalDictation: Bool { true }
+    func begin(targetDescription: String) {}
+    func waitForFinalTranscript() {}
+    func hide() {}
+    func showSending() {}
+    func showWaitingForClipboard() {}
+    func showError(_ message: String) {}
+    func currentText() -> String { "" }
+}
+
+private final class TestTranscriptDelivery: TranscriptDelivery {
+    struct Request {
+        let text: String
+        let target: UURemoteTarget
+        let completion: (Result<Void, Error>) -> Void
+        let cleanup: () -> Void
+    }
+    var requests: [Request] = []
+    func deliver(text: String, to target: UURemoteTarget,
+                 panelWillHide: @escaping () -> Void,
+                 completion: @escaping (Result<Void, Error>) -> Void,
+                 cleanupCompletion: @escaping () -> Void) {
+        panelWillHide()
+        requests.append(Request(text: text, target: target, completion: completion, cleanup: cleanupCompletion))
+    }
+    func restoreClipboardForTermination() {}
 }

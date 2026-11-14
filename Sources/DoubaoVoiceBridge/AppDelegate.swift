@@ -84,7 +84,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startMonitorOrRequestPermissions(promptIfNeeded: true)
         screenshots.canStart = { [weak self] in
             guard let self else { return false }
-            return self.coordinator.state == .idle && self.monitor?.isGestureIdle == true
+            return self.coordinator.state == .idle && !self.coordinator.isClipboardBusy
+                && self.monitor?.isGestureIdle == true
         }
         screenshots.onStatusChange = { [weak self] text, error in self?.setStatus(text, isError: error) }
         screenshots.start()

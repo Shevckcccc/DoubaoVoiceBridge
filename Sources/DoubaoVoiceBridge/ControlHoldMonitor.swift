@@ -20,7 +20,7 @@ final class ControlHoldMonitor {
     private let onBegin: (UURemoteTarget) -> Void
     private let onRelease: () -> Void
     private let onCancel: () -> Void
-    private let physicalKeyState: (CGKeyCode) -> Bool
+    private let physicalKeyState: (CGKeyCode) -> Bool?
     private let controlEventPoster: ((Bool, SyntheticControlRoute) -> Bool)?
     private let logger = Logger(subsystem: "com.lyp.DoubaoVoiceBridge", category: "control")
 
@@ -49,8 +49,8 @@ final class ControlHoldMonitor {
         onBegin: @escaping (UURemoteTarget) -> Void,
         onRelease: @escaping () -> Void,
         onCancel: @escaping () -> Void,
-        physicalKeyState: @escaping (CGKeyCode) -> Bool = {
-            CGEventSource.keyState(.hidSystemState, key: $0)
+        physicalKeyState: @escaping (CGKeyCode) -> Bool? = {
+            PhysicalControlKeys.shared.isDown($0)
         },
         controlEventPoster: ((Bool, SyntheticControlRoute) -> Bool)? = nil
     ) {
@@ -142,13 +142,16 @@ final class ControlHoldMonitor {
     }
 
     private func synchronizePhysicalKeys() {
-        physicalLeftControlIsDown = physicalKeyState(CGKeyCode(Self.leftControlKeyCode))
-        physicalRightControlIsDown = physicalKeyState(62)
+        if let down = physicalKeyState(CGKeyCode(Self.leftControlKeyCode)) { physicalLeftControlIsDown = down }
+        if let down = physicalKeyState(62) { physicalRightControlIsDown = down }
     }
 
     func reconcilePhysicalControlState(now: Date = Date()) {
-        let leftIsDown = physicalKeyState(CGKeyCode(Self.leftControlKeyCode))
-        physicalRightControlIsDown = physicalKeyState(62)
+        if let down = physicalKeyState(62) { physicalRightControlIsDown = down }
+        guard let leftIsDown = physicalKeyState(CGKeyCode(Self.leftControlKeyCode)) else {
+            releaseRecovery.reset()
+            return
+        }
         if gesture.phase == .idle {
             physicalLeftControlIsDown = leftIsDown
         }

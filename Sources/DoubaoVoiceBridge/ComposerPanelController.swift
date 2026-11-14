@@ -181,6 +181,13 @@ final class ComposerPanelController: NSWindowController, NSTextViewDelegate {
         window?.makeFirstResponder(textView)
     }
 
+    func showWaitingForClipboard() {
+        showSending()
+        statusLabel.stringValue = "文字已就绪，等待上一轮粘贴完成…按 Esc 取消"
+        // Keep Escape available while queued, without accepting more transcript.
+        window?.makeFirstResponder(textView)
+    }
+
     func hide() {
         isWaitingForFinalTranscript = false
         acceptsTranscriptUpdates = false
