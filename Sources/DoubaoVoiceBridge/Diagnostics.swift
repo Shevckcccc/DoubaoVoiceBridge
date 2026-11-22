@@ -41,7 +41,9 @@ enum Diagnostics {
             ("accessibility", AXIsProcessTrusted() ? "granted" : "missing"),
             ("input_monitoring", CGPreflightListenEventAccess() ? "granted" : "missing"),
             ("hid_event_tap", probeTap == nil ? "unavailable" : "available"),
-            ("physical_control_observer", PhysicalControlKeys.shared.isAvailable ? "available" : "unavailable"),
+            ("composer_mode", "manual_return_to_paste"),
+            ("composer_shortcut", "standalone_left_control_hold_0.3s"),
+            ("control_interception", "disabled"),
             ("doubao", FileManager.default.fileExists(atPath: doubaoPath) ? "installed" : "missing"),
             ("uuremote", uuRemote == nil ? "not_running" : "running"),
             ("frontmost", workspace.frontmostApplication?.bundleIdentifier ?? "unknown")

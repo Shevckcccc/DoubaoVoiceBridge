@@ -6,17 +6,21 @@ final class DictationPanel: NSPanel {
     override var canBecomeMain: Bool { true }
 }
 
+enum ComposerSubmitPolicy {
+    static func shouldCommit(keyCode: UInt16, modifiers: NSEvent.ModifierFlags, hasMarkedText: Bool) -> Bool {
+        let disallowed: NSEvent.ModifierFlags = [.command, .control, .option, .shift]
+        return (keyCode == 36 || keyCode == 76) && modifiers.intersection(disallowed).isEmpty && !hasMarkedText
+    }
+}
+
 final class ComposerTextView: NSTextView {
     var onCommit: (() -> Void)?
     var onCancel: (() -> Void)?
     var onControlReleased: (() -> Void)?
 
     override func keyDown(with event: NSEvent) {
-        let isReturn = event.keyCode == 36 || event.keyCode == 76
-        let disallowedModifiers: NSEvent.ModifierFlags = [.command, .control, .option]
-        if isReturn,
-           event.modifierFlags.intersection(disallowedModifiers).isEmpty,
-           !hasMarkedText() {
+        if ComposerSubmitPolicy.shouldCommit(keyCode: event.keyCode,
+            modifiers: event.modifierFlags, hasMarkedText: hasMarkedText()) {
             onCommit?()
             return
         }
@@ -99,6 +103,7 @@ final class ComposerPanelController: NSWindowController, NSTextViewDelegate {
     private var lastLoggedMarkedState = false
     private var isWaitingForFinalTranscript = false
     private var acceptsTranscriptUpdates = false
+    private var mode: ComposerSessionMode = .manual
 
     init() {
         let panel = DictationPanel(
@@ -125,7 +130,8 @@ final class ComposerPanelController: NSWindowController, NSTextViewDelegate {
         fatalError("init(coder:) has not been implemented")
     }
 
-    func begin(targetDescription: String) {
+    func begin(targetDescription: String, mode: ComposerSessionMode) {
+        self.mode = mode
         sessionID = UUID()
         cancelSettleTimer()
         textView.string = ""
@@ -136,7 +142,9 @@ final class ComposerPanelController: NSWindowController, NSTextViewDelegate {
         textView.isEditable = true
         lastTextChangeAt = Date()
         targetLabel.stringValue = targetDescription
-        statusLabel.stringValue = "正在启动豆包语音输入法…按住左 ⌃ 说话，松开后自动发送"
+        statusLabel.stringValue = mode == .manual
+            ? "用豆包语音键或直接输入；回车粘贴，Shift+回车换行，Esc 取消"
+            : "正在启动豆包语音输入法…按住左 ⌃ 说话，松开后自动发送"
         statusLabel.textColor = .secondaryLabelColor
 
         guard let window else { return }
@@ -151,7 +159,14 @@ final class ComposerPanelController: NSWindowController, NSTextViewDelegate {
         )
     }
 
+    func activate() {
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+        window?.makeFirstResponder(textView)
+    }
+
     func waitForFinalTranscript() {
+        guard mode == .automatic else { return }
         isWaitingForFinalTranscript = true
         statusLabel.stringValue = "正在等待豆包语音输入法完成识别…"
         statusLabel.textColor = .secondaryLabelColor
@@ -221,7 +236,11 @@ final class ComposerPanelController: NSWindowController, NSTextViewDelegate {
             )
         }
         if length > 0, acceptsTranscriptUpdates {
-            if isWaitingForFinalTranscript {
+            if mode == .manual {
+                statusLabel.stringValue = marked
+                    ? "正在输入…完成后按回车粘贴，Esc 取消"
+                    : "可继续修改；回车粘贴到远端，Shift+回车换行"
+            } else if isWaitingForFinalTranscript {
                 statusLabel.stringValue = marked
                     ? "豆包语音输入法正在完成识别…"
                     : "已收到识别文字，正在准备自动发送…"
@@ -254,12 +273,16 @@ final class ComposerPanelController: NSWindowController, NSTextViewDelegate {
         textView.textColor = .labelColor
         textView.backgroundColor = .textBackgroundColor
         textView.isRichText = false
+        textView.setAccessibilityLabel("远端输入内容")
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.textContainerInset = NSSize(width: 12, height: 10)
         textView.onCommit = { [weak self] in self?.commitCurrentText() }
         textView.onCancel = { [weak self] in self?.onCancel?() }
-        textView.onControlReleased = { [weak self] in self?.onControlReleased?() }
+        textView.onControlReleased = { [weak self] in
+            guard let self, self.mode == .automatic else { return }
+            self.onControlReleased?()
+        }
 
         ComposerTextLayout.attach(textView, to: scrollView)
         scrollView.hasVerticalScroller = true

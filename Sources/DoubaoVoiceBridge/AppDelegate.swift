@@ -1,6 +1,5 @@
 import AppKit
 import ApplicationServices
-import notify
 import os.log
 
 enum LatencyDefaultsMigration {
@@ -34,24 +33,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let logger = Logger(subsystem: "com.lyp.DoubaoVoiceBridge", category: "app")
     private let coordinator = SessionCoordinator()
     private let screenshots = ScreenshotCoordinator()
-    private var monitor: ControlHoldMonitor?
+    private var composerShortcut: ComposerShortcut?
+    private var statusMenu: NSMenu?
     private var statusItem: NSStatusItem?
     private var statusText = "正在启动…"
     private var statusIsError = false
-    private var permissionRetryTimer: Timer?
-    private var workspaceObservers: [NSObjectProtocol] = []
-    private var observedUURemotePID: pid_t?
-    private var eventTapNotificationTokens: [Int32] = []
-    private var tapOrderAuditWorkItem: DispatchWorkItem?
-    private var tapOrderAuditTimer: Timer?
-    private var tapReinstallTimes: [Date] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         UserDefaults.standard.register(defaults: [
             "pasteDelay": UURemoteDelivery.defaultPasteDelay,
             "restoreClipboard": true,
-            "autoPasteUU": true,
-            "controlHoldThreshold": 0.18
+            "autoPasteUU": true
         ])
         UserDefaults.standard.set(true, forKey: "autoPasteUU")
         migrateLatencyDefaultsIfNeeded()
@@ -61,65 +53,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.setStatus(text, isError: isError)
         }
 
-        let monitor = ControlHoldMonitor(
-            holdThreshold: UserDefaults.standard.double(forKey: "controlHoldThreshold"),
-            targetProvider: { [weak self] in
-                guard let self, self.coordinator.canBegin, !self.screenshots.isBusy else { return nil }
-                return self.currentUURemoteTarget()
-            },
-            localComposerReady: { [weak self] in
-                self?.coordinator.isLocalComposerReady ?? false
-            },
-            onBegin: { [weak self] target in self?.coordinator.begin(target: target) },
-            onRelease: { [weak self] in self?.coordinator.controlReleased() },
-            onCancel: { [weak self] in self?.coordinator.cancel() }
-        )
-        self.monitor = monitor
-        coordinator.onGestureFinished = { [weak self] in
-            self?.monitor?.finishSessionGesture()
-            self?.scheduleTapOrderAudit(after: 0.1)
+        let shortcut = ComposerShortcut { [weak self] in
+            guard let self else { return }
+            if self.coordinator.activateExistingSession() { return }
+            guard self.currentUURemoteTarget() != nil else { return }
+            self.openComposerManually()
         }
-        observeUURemoteLifecycle()
-        observeEventTapChanges()
-        startMonitorOrRequestPermissions(promptIfNeeded: true)
+        composerShortcut = shortcut
+        let shortcutStatus = shortcut.start()
+        logger.notice("Composer shortcut registration status=\(shortcutStatus)")
+        if shortcutStatus == 0 {
+            setStatus("就绪 · 点击图标或长按左 Control 打开输入框", isError: false)
+        } else {
+            setStatus("Control 开框需要输入监控权限，请点击图标打开或右键检查权限", isError: true)
+        }
         screenshots.canStart = { [weak self] in
             guard let self else { return false }
             return self.coordinator.state == .idle && !self.coordinator.isClipboardBusy
-                && self.monitor?.isGestureIdle == true
         }
         screenshots.onStatusChange = { [weak self] text, error in self?.setStatus(text, isError: error) }
         screenshots.start()
-        if !UserDefaults.standard.bool(forKey: "didShowScreenshotV24") {
-            UserDefaults.standard.set(true, forKey: "didShowScreenshotV24")
-            screenshots.showTools()
-        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        screenshots.showTools()
+        openComposerManually()
         return true
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        monitor?.stop()
+        composerShortcut?.stop()
         coordinator.prepareForTermination()
         screenshots.prepareForTermination()
-        permissionRetryTimer?.invalidate()
-        tapOrderAuditWorkItem?.cancel()
-        tapOrderAuditTimer?.invalidate()
-        for token in eventTapNotificationTokens {
-            notify_cancel(token)
-        }
-        for observer in workspaceObservers {
-            NSWorkspace.shared.notificationCenter.removeObserver(observer)
-        }
     }
 
     private func configureStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = item.button {
             button.image = NSImage(systemSymbolName: "mic.and.signal.meter", accessibilityDescription: "远控听写")
-            button.toolTip = "远控听写"
+            button.toolTip = "点击打开输入框 · 左 Control · 右键查看菜单"
+            button.target = self
+            button.action = #selector(statusItemClicked)
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
         statusItem = item
         rebuildMenu()
@@ -157,12 +131,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         menu.addItem(status)
 
-        let instruction = NSMenuItem(title: "按住左 ⌃ 说话，松开自动上屏", action: nil, keyEquivalent: "")
+        let instruction = NSMenuItem(title: "打开输入框 → 豆包语音或键入 → 回车粘贴", action: nil, keyEquivalent: "")
         instruction.isEnabled = false
         menu.addItem(instruction)
         menu.addItem(.separator())
 
-        let manual = NSMenuItem(title: "手动打开听写框", action: #selector(openComposerManually), keyEquivalent: "")
+        let manual = NSMenuItem(title: "打开输入框（左 Control）", action: #selector(openComposerManually), keyEquivalent: "")
         manual.target = self
         menu.addItem(manual)
 
@@ -181,7 +155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let quit = NSMenuItem(title: "退出远控听写", action: #selector(quitApplication), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
-        statusItem?.menu = menu
+        statusMenu = menu
     }
 
     private func currentUURemoteTarget() -> UURemoteTarget? {
@@ -193,13 +167,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return UURemoteTarget(application: frontmost)
     }
 
+    @objc private func statusItemClicked() {
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            showStatusMenu()
+        } else {
+            openComposerManually()
+        }
+    }
+
+    private func showStatusMenu() {
+        guard let statusItem, let button = statusItem.button, let statusMenu else { return }
+        statusItem.menu = statusMenu
+        button.performClick(nil)
+        statusItem.menu = nil
+    }
+
     @objc private func openComposerManually() {
-        guard let target = currentUURemoteTarget() else {
-            setStatus("请先点回 UU 远控，再长按左 ⌃", isError: true)
+        if coordinator.activateExistingSession() { return }
+        guard coordinator.canBegin, !screenshots.isBusy else {
+            setStatus("正在传送内容，请稍候再打开输入框", isError: true)
+            showStatusMenu()
             return
         }
-        target.captureFocusedWindow()
-        coordinator.begin(target: target)
+        guard AXIsProcessTrusted(), let target = currentUURemoteTarget(), target.captureFocusedWindow() else {
+            setStatus("请先在 UU 中点好远端输入框，再点击图标或长按左 Control", isError: true)
+            showStatusMenu()
+            return
+        }
+        logger.notice("Opening manual composer; no Control synthesis")
+        coordinator.begin(target: target, mode: .manual)
     }
 
     @objc private func openPermissions() {
@@ -217,123 +213,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if !inputGranted {
             openSystemSettings(anchor: "Privacy_ListenEvent")
         }
-    }
-
-    private func startMonitorOrRequestPermissions(promptIfNeeded: Bool) {
-        guard let monitor, monitor.activeTapLocation == nil else { return }
-        do {
-            try monitor.start()
-            permissionRetryTimer?.invalidate()
-            permissionRetryTimer = nil
-            setStatus("就绪 · 在 UU 远控中长按左 ⌃", isError: false)
-        } catch {
-            logger.error("Unable to start control monitor: \(error.localizedDescription, privacy: .public)")
-            setStatus("需要开启辅助功能与输入监控权限", isError: true)
-            if promptIfNeeded {
-                requestRequiredPermissions()
-            }
-            if permissionRetryTimer == nil {
-                permissionRetryTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-                    self?.startMonitorOrRequestPermissions(promptIfNeeded: false)
-                }
-            }
-        }
-    }
-
-    private func observeUURemoteLifecycle() {
-        observedUURemotePID = NSWorkspace.shared.runningApplications.first {
-            $0.bundleIdentifier == Self.uuRemoteBundleIdentifier
-        }?.processIdentifier
-
-        let center = NSWorkspace.shared.notificationCenter
-        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didActivateApplicationNotification] {
-            let observer = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] notification in
-                guard let self,
-                      let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-                      [Self.uuRemoteBundleIdentifier, Self.doubaoIMEBundleIdentifier].contains(application.bundleIdentifier ?? "") else { return }
-                if application.bundleIdentifier == Self.doubaoIMEBundleIdentifier {
-                    self.scheduleTapOrderAudit(after: 0.25)
-                    return
-                }
-                let pid = application.processIdentifier
-                let delay = UURemoteActivationAudit.delay(
-                    previousPID: self.observedUURemotePID,
-                    activatedPID: pid
-                )
-                self.observedUURemotePID = pid
-                self.scheduleTapOrderAudit(after: delay)
-            }
-            workspaceObservers.append(observer)
-        }
-    }
-
-    private func observeEventTapChanges() {
-        for name in [
-            "com.apple.coregraphics.eventTapAdded",
-            "com.apple.coregraphics.eventTapRemoved"
-        ] {
-            var token: Int32 = 0
-            let status = notify_register_dispatch(name, &token, .main) { [weak self] _ in
-                self?.scheduleTapOrderAudit(after: 0.08)
-            }
-            if status == NOTIFY_STATUS_OK {
-                eventTapNotificationTokens.append(token)
-            } else {
-                logger.error("Unable to observe event-tap changes (status=\(status, privacy: .public))")
-            }
-        }
-
-        tapOrderAuditTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
-            self?.auditTapOrder()
-        }
-    }
-
-    private func scheduleTapOrderAudit(after delay: TimeInterval) {
-        tapOrderAuditWorkItem?.cancel()
-        let workItem = DispatchWorkItem { [weak self] in self?.auditTapOrder() }
-        tapOrderAuditWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
-    }
-
-    private func auditTapOrder() {
-        guard let monitor, monitor.activeTapLocation != nil, monitor.isGestureIdle,
-              let uuRemote = NSWorkspace.shared.runningApplications.first(where: {
-                  $0.bundleIdentifier == Self.uuRemoteBundleIdentifier && !$0.isTerminated
-              }) else { return }
-
-        let taps = Self.installedEventTaps()
-        let bridgePID = ProcessInfo.processInfo.processIdentifier
-        guard UURemoteTapOrder.needsReinstall(
-            taps: taps,
-            bridgePID: bridgePID,
-            uuRemotePID: uuRemote.processIdentifier,
-            inputMethodPID: NSWorkspace.shared.runningApplications.first {
-                $0.bundleIdentifier == Self.doubaoIMEBundleIdentifier && !$0.isTerminated
-            }?.processIdentifier
-        ) else { return }
-
-        let now = Date()
-        tapReinstallTimes.removeAll { now.timeIntervalSince($0) > 5.0 }
-        guard tapReinstallTimes.count < 3 else {
-            logger.error("Tap-order contention detected; deferring to the low-frequency audit")
-            return
-        }
-        tapReinstallTimes.append(now)
-        logger.notice("UU or Doubao keyboard tap moved ahead; reinstalling local head tap")
-        monitor.stop()
-        startMonitorOrRequestPermissions(promptIfNeeded: false)
-    }
-
-    private static func installedEventTaps() -> [InstalledEventTap] {
-        var count: UInt32 = 0
-        guard CGGetEventTapList(0, nil, &count) == .success else { return [] }
-        let capacity = max(count + 8, 32)
-        let buffer = UnsafeMutablePointer<CGEventTapInformation>.allocate(capacity: Int(capacity))
-        defer { buffer.deallocate() }
-
-        var filled = capacity
-        guard CGGetEventTapList(capacity, buffer, &filled) == .success else { return [] }
-        return (0..<Int(filled)).map { InstalledEventTap(buffer[$0]) }
     }
 
     private func openSystemSettings(anchor: String) {

@@ -1,6 +1,7 @@
 import Foundation
 import CoreGraphics
 import AppKit
+import Carbon.HIToolbox
 
 enum SelfTests {
     static func run() -> Bool {
@@ -451,8 +452,125 @@ enum SelfTests {
             check(ScreenshotPolicy.syncDelay(bytes: 20 * 1024 * 1024), 15, "bounded image sync window")
         }
 
+        do {
+            let panel = TestDictationComposer()
+            let delivery = TestTranscriptDelivery()
+            let coordinator = SessionCoordinator(panel: panel, delivery: delivery, activateTarget: { _ in })
+            let target = UURemoteTarget(application: .current)
+            coordinator.begin(target: target)
+            panel.text = "manual draft"
+            coordinator.controlReleased()
+            panel.onControlReleased?()
+            panel.onTranscriptTimeout?()
+            check(coordinator.state, .listening, "manual Control release and timeout cannot end editing")
+            check(panel.waitCount, 0, "manual input never starts transcript settlement")
+            check(delivery.requests.count, 0, "manual dictation cannot auto-paste on release")
+            check(coordinator.activateExistingSession(), true, "repeated open refocuses existing draft")
+            check(panel.beginCount, 1, "repeated open does not clear draft")
+            check(panel.text, "manual draft", "draft survives refocus")
+            panel.onCommit?(panel.text)
+            check(delivery.requests.count, 1, "explicit commit delivers exactly once")
+            check(delivery.requests[0].target === target, true, "manual commit retains captured target")
+            delivery.requests[0].completion(.success(()))
+            delivery.requests[0].cleanup()
+            coordinator.begin(target: target)
+            coordinator.cancel()
+            check(delivery.requests.count, 1, "cancelled manual draft is not pasted")
+            coordinator.begin(target: target, mode: .automatic)
+            coordinator.controlReleased()
+            check(panel.waitCount, 1, "legacy settlement remains explicit rather than manual default")
+        }
+
+        do {
+            check(ComposerSubmitPolicy.shouldCommit(keyCode: 36, modifiers: [], hasMarkedText: false), true, "Return confirms completed text")
+            check(ComposerSubmitPolicy.shouldCommit(keyCode: 76, modifiers: [], hasMarkedText: false), true, "keypad Enter confirms text")
+            check(ComposerSubmitPolicy.shouldCommit(keyCode: 36, modifiers: [], hasMarkedText: true), false, "IME candidate confirmation cannot paste unfinished text")
+            check(ComposerSubmitPolicy.shouldCommit(keyCode: 36, modifiers: [.shift], hasMarkedText: false), false, "Shift Return remains newline")
+            check(ComposerSubmitPolicy.shouldCommit(keyCode: 36, modifiers: [.control], hasMarkedText: false), false, "voice modifier cannot submit text")
+        }
+
+        do {
+            var event: EventRef?
+            let created = CreateEvent(nil, OSType(kEventClassKeyboard), UInt32(kEventHotKeyPressed), 0, 0, &event)
+            if created == noErr, let event {
+                defer { ReleaseEvent(event) }
+                var identifier = EventHotKeyID(signature: OSType(0x4456424D), id: UInt32(1))
+                SetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                    MemoryLayout<EventHotKeyID>.size, &identifier)
+                check(HotKeyEvent.matches(event, signature: OSType(0x4456424D), id: UInt32(1)), true, "composer hotkey reaches its own handler")
+                check(HotKeyEvent.matches(event, signature: 0x44564253, id: 2), false, "screenshot handler cannot swallow composer hotkey")
+                identifier = EventHotKeyID(signature: 0x44564253, id: 2)
+                SetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                    MemoryLayout<EventHotKeyID>.size, &identifier)
+                check(HotKeyEvent.matches(event, signature: OSType(0x4456424D), id: UInt32(1)), false, "composer handler cannot swallow screenshot hotkey")
+            } else { failures.append("Unable to construct hotkey routing event") }
+        }
+
+        do {
+            var gesture = StandaloneControlGesture()
+            for index in 1...5 {
+                check(gesture.handle(device: 1, usage: 0xE0, down: true), false, "Control waits for threshold \(index)")
+                check(gesture.isPending, true, "standalone Control arms hold")
+                check(gesture.thresholdReached(), true, "standalone Control opens repeatedly \(index)")
+                check(gesture.thresholdReached(), false, "held Control cannot open twice")
+                check(gesture.handle(device: 1, usage: 0xE0, down: false), false, "release does not open again")
+                check(gesture.handle(device: 1, usage: 0xE0, down: false), false, "duplicate Control up never opens twice")
+            }
+            _ = gesture.handle(device: 1, usage: 0xE0, down: true)
+            _ = gesture.handle(device: 1, usage: 0xE0, down: false)
+            check(gesture.thresholdReached(), false, "quick tap cannot open")
+            _ = gesture.handle(device: 1, usage: 0xE0, down: true)
+            _ = gesture.handle(device: 1, usage: 0x06, down: true) // Physical C usage, not a text character.
+            _ = gesture.handle(device: 1, usage: 0x06, down: false)
+            check(gesture.thresholdReached(), false, "Control-C cannot open at threshold")
+            check(gesture.handle(device: 1, usage: 0xE0, down: false), false, "Control-C does not open after C is released")
+            _ = gesture.handle(device: 1, usage: 0xE1, down: true)
+            _ = gesture.handle(device: 1, usage: 0xE0, down: true)
+            check(gesture.handle(device: 1, usage: 0xE0, down: false), false, "Shift-Control is not standalone")
+            _ = gesture.handle(device: 1, usage: 0xE1, down: false)
+            _ = gesture.handle(device: 1, usage: 0xE0, down: true)
+            _ = gesture.handle(device: 2, usage: 0x04, down: true)
+            _ = gesture.handle(device: 2, usage: 0x04, down: false)
+            check(gesture.handle(device: 1, usage: 0xE0, down: false), false, "another keyboard can complete a chord")
+            _ = gesture.handle(device: 1, usage: 0xE0, down: true)
+            gesture.removeDevice(1)
+            check(gesture.handle(device: 1, usage: 0xE0, down: false), false, "unplugging a held keyboard cannot open")
+            _ = gesture.handle(device: 1, usage: 0xE0, down: true)
+            check(gesture.thresholdReached(), true, "reconnected keyboard can open")
+            _ = gesture.handle(device: 1, usage: 0xE0, down: false)
+            _ = gesture.handle(device: 1, usage: 0xE0, down: true)
+            gesture.cancelForOtherInput()
+            check(gesture.thresholdReached(), false, "Control mouse chord cancels hold")
+        }
+
+        do {
+            var openings = 0
+            let shortcut = ComposerShortcut { openings += 1 }
+            shortcut.handlePhysicalKey(device: 1, usage: 0xE0, down: true)
+            shortcut.handlePhysicalKey(device: 1, usage: 0xE0, down: false)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.15))
+            shortcut.handlePhysicalKey(device: 1, usage: 0xE0, down: true)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.20))
+            check(openings, 0, "cancelled earlier timer cannot open the next hold early")
+            RunLoop.current.run(until: Date().addingTimeInterval(0.15))
+            check(openings, 1, "production timer opens only after standalone hold threshold")
+            RunLoop.current.run(until: Date().addingTimeInterval(0.35))
+            check(openings, 1, "holding longer opens only once")
+            shortcut.handlePhysicalKey(device: 1, usage: 0xE0, down: false)
+            shortcut.handlePhysicalKey(device: 1, usage: 0xE0, down: true)
+            shortcut.handlePhysicalKey(device: 1, usage: 0x06, down: true)
+            shortcut.handlePhysicalKey(device: 1, usage: 0x06, down: false)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.35))
+            check(openings, 1, "real hold timer is cancelled by a Control-C chord")
+            shortcut.handlePhysicalKey(device: 1, usage: 0xE0, down: false)
+            shortcut.handlePhysicalKey(device: 1, usage: 0xE0, down: true)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.35))
+            check(openings, 2, "next standalone hold opens after a chord")
+            shortcut.stop()
+        }
+
         if failures.isEmpty {
-            print("SELF_TEST_OK groups=16 (repeated holds + unknown hardware + consecutive delivery + voice/image guards)")
+            print("SELF_TEST_OK groups=21 (standalone Control timer + manual confirmation + IME composition + routing)")
             return true
         }
         for failure in failures {
@@ -468,8 +586,12 @@ private final class TestDictationComposer: DictationComposer {
     var onControlReleased: (() -> Void)?
     var onTranscriptTimeout: (() -> Void)?
     var isReadyForLocalDictation: Bool { true }
-    func begin(targetDescription: String) {}
-    func waitForFinalTranscript() {}
+    var beginCount = 0
+    var waitCount = 0
+    var text = ""
+    func begin(targetDescription: String, mode: ComposerSessionMode) { beginCount += 1; text = "" }
+    func activate() {}
+    func waitForFinalTranscript() { waitCount += 1 }
     func hide() {}
     func showSending() {}
     func showWaitingForClipboard() {}

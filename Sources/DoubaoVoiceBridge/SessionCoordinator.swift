@@ -1,12 +1,18 @@
 import AppKit
 
+enum ComposerSessionMode {
+    case manual
+    case automatic
+}
+
 protocol DictationComposer: AnyObject {
     var onCommit: ((String) -> Void)? { get set }
     var onCancel: (() -> Void)? { get set }
     var onControlReleased: (() -> Void)? { get set }
     var onTranscriptTimeout: (() -> Void)? { get set }
     var isReadyForLocalDictation: Bool { get }
-    func begin(targetDescription: String)
+    func begin(targetDescription: String, mode: ComposerSessionMode)
+    func activate()
     func waitForFinalTranscript()
     func hide()
     func showSending()
@@ -47,6 +53,7 @@ final class SessionCoordinator {
     private var target: UURemoteTarget?
     private var deliveryAwaitingCleanup = false
     private var queuedText: String?
+    private var mode: ComposerSessionMode = .manual
     var isClipboardBusy: Bool { deliveryAwaitingCleanup }
 
     var canBegin: Bool {
@@ -69,16 +76,24 @@ final class SessionCoordinator {
         panel.onTranscriptTimeout = { [weak self] in self?.handleTranscriptTimeout() }
     }
 
-    func begin(target: UURemoteTarget) {
+    @discardableResult
+    func activateExistingSession() -> Bool {
+        guard target != nil, state == .listening || state == .finalizing || state == .failed else { return false }
+        panel.activate()
+        return true
+    }
+
+    func begin(target: UURemoteTarget, mode: ComposerSessionMode = .manual) {
         guard canBegin else { return }
+        self.mode = mode
         self.target = target
         state = .listening
-        panel.begin(targetDescription: "发送到 Mac mini · UU 远控")
-        onStatusChange?("正在听写…松开左 ⌃ 自动发送", false)
+        panel.begin(targetDescription: "粘贴到 UU 远端输入框", mode: mode)
+        onStatusChange?(mode == .manual ? "输入或听写后，按回车粘贴到远端" : "正在听写…松开左 ⌃ 自动发送", false)
     }
 
     func controlReleased() {
-        guard state == .listening else { return }
+        guard mode == .automatic, state == .listening else { return }
         state = .finalizing
         onGestureFinished?()
         panel.waitForFinalTranscript()
@@ -94,7 +109,7 @@ final class SessionCoordinator {
         onGestureFinished?()
         panel.hide()
         if let target { activateTarget(target) }
-        onStatusChange?("就绪 · 在 UU 远控中长按左 ⌃", false)
+        onStatusChange?("就绪 · 点击图标或长按左 Control 打开输入框", false)
     }
 
     func prepareForTermination() {
@@ -147,13 +162,14 @@ final class SessionCoordinator {
                     self.state = .finalizing
                     self.send(text: text)
                 } else if self.state == .idle {
-                    self.onStatusChange?("就绪 · 在 UU 远控中长按左 ⌃", false)
+                    self.onStatusChange?("就绪 · 点击图标或长按左 Control 打开输入框", false)
                 }
             }
         )
     }
 
     private func handleTranscriptTimeout() {
+        guard mode == .automatic else { return }
         state = .failed
         onGestureFinished?()
         if panel.currentText().isEmpty {

@@ -87,8 +87,10 @@ final class ScreenshotCoordinator: NSObject {
 
     func start() {
         var type = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        let result = InstallEventHandler(GetApplicationEventTarget(), { _, _, data in
-            guard let data else { return noErr }
+        let result = InstallEventHandler(GetApplicationEventTarget(), { _, event, data in
+            guard let data,
+                  HotKeyEvent.matches(event, signature: 0x44564253, id: 2)
+            else { return OSStatus(eventNotHandledErr) }
             let owner = Unmanaged<ScreenshotCoordinator>.fromOpaque(data).takeUnretainedValue()
             owner.logger.notice("Screenshot shortcut received")
             DispatchQueue.main.async { owner.beginCapture() }
