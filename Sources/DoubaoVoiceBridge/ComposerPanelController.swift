@@ -17,6 +17,26 @@ final class ComposerTextView: NSTextView {
     var onCommit: (() -> Void)?
     var onCancel: (() -> Void)?
     var onControlReleased: (() -> Void)?
+    var onBeforeInputMutation: ((String) -> Void)?
+    var onAfterInputMutation: ((String) -> Void)?
+
+    override func insertText(_ insertString: Any, replacementRange: NSRange) {
+        onBeforeInputMutation?("input.insert")
+        defer { onAfterInputMutation?("input.insert") }
+        super.insertText(insertString, replacementRange: replacementRange)
+    }
+
+    override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        onBeforeInputMutation?("input.marked")
+        defer { onAfterInputMutation?("input.marked") }
+        super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
+    }
+
+    override func unmarkText() {
+        onBeforeInputMutation?("input.unmark")
+        defer { onAfterInputMutation?("input.unmark") }
+        super.unmarkText()
+    }
 
     override func keyDown(with event: NSEvent) {
         if ComposerSubmitPolicy.shouldCommit(keyCode: event.keyCode,
@@ -94,6 +114,19 @@ final class ComposerPanelController: NSWindowController, NSTextViewDelegate {
     private let scrollView = NSScrollView()
     private let statusLabel = NSTextField(labelWithString: "")
     private let targetLabel = NSTextField(labelWithString: "")
+    private let recoveryButton = NSButton(title: "恢复上一版", target: nil, action: nil)
+    private let historyButton = NSButton(title: "输入历史", target: nil, action: nil)
+    private let saveLabel = NSTextField(wrappingLabelWithString: "")
+    private let history: InputHistoryJournal
+    private let presentWindow: (NSWindow, NSTextView) -> Void
+    private var historyController: InputHistoryController?
+    private var storageObserver: NSObjectProtocol?
+    private var hasSession = false
+    private var mutationReasons: [String] = []
+    private var lastObservedText = ""
+    private var becameEmpty = false
+    private var rollbackCursor: Int64?
+    private var isRestoring = false
     private let logger = Logger(subsystem: "com.lyp.DoubaoVoiceBridge", category: "composer")
     private var settleWorkItem: DispatchWorkItem?
     private var settleStartedAt: Date?
@@ -105,9 +138,16 @@ final class ComposerPanelController: NSWindowController, NSTextViewDelegate {
     private var acceptsTranscriptUpdates = false
     private var mode: ComposerSessionMode = .manual
 
-    init() {
+    init(history: InputHistoryJournal = InputHistoryJournal(),
+         presentWindow: @escaping (NSWindow, NSTextView) -> Void = { window, textView in
+             NSApp.activate(ignoringOtherApps: true)
+             window.makeKeyAndOrderFront(nil)
+             window.makeFirstResponder(textView)
+         }) {
+        self.history = history
+        self.presentWindow = presentWindow
         let panel = DictationPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 570, height: 176),
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 300),
             styleMask: [.titled, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -124,22 +164,40 @@ final class ComposerPanelController: NSWindowController, NSTextViewDelegate {
         panel.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.97)
         super.init(window: panel)
         buildInterface(in: panel)
+        storageObserver = NotificationCenter.default.addObserver(forName: NSTextStorage.didProcessEditingNotification,
+            object: textView.textStorage, queue: nil) { [weak self] notification in
+                guard let self, let storage = notification.object as? NSTextStorage,
+                      storage.editedMask.contains(.editedCharacters) else { return }
+                self.captureVersion(reason: self.mutationReasons.last ?? "text-storage")
+            }
+        updateSaveStatus()
     }
+
+    deinit { if let storageObserver { NotificationCenter.default.removeObserver(storageObserver) } }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
 
     func begin(targetDescription: String, mode: ComposerSessionMode) {
+        captureVersion(reason: "app.before-new-session")
         self.mode = mode
         sessionID = UUID()
+        hasSession = true
+        rollbackCursor = nil
+        becameEmpty = false
         cancelSettleTimer()
+        mutationReasons.append("app.new-session")
         textView.string = ""
+        captureVersion(reason: "app.new-session")
+        mutationReasons.removeLast()
+        textView.undoManager?.removeAllActions()
         lastLoggedLength = -1
         lastLoggedMarkedState = false
         isWaitingForFinalTranscript = false
         acceptsTranscriptUpdates = true
         textView.isEditable = true
+        updateSaveStatus()
         lastTextChangeAt = Date()
         targetLabel.stringValue = targetDescription
         statusLabel.stringValue = mode == .manual
@@ -149,20 +207,16 @@ final class ComposerPanelController: NSWindowController, NSTextViewDelegate {
 
         guard let window else { return }
         position(window)
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
+        presentWindow(window, textView)
         window.contentView?.layoutSubtreeIfNeeded()
         ComposerTextLayout.synchronize(textView, with: scrollView)
-        window.makeFirstResponder(textView)
         logger.notice(
             "Composer ready session=\(self.shortSessionID, privacy: .public) textWidth=\(self.textView.frame.width, privacy: .public) containerWidth=\(self.textView.textContainer?.containerSize.width ?? 0, privacy: .public)"
         )
     }
 
     func activate() {
-        NSApp.activate(ignoringOtherApps: true)
-        window?.makeKeyAndOrderFront(nil)
-        window?.makeFirstResponder(textView)
+        if let window { presentWindow(window, textView) }
     }
 
     func waitForFinalTranscript() {
@@ -176,12 +230,14 @@ final class ComposerPanelController: NSWindowController, NSTextViewDelegate {
     }
 
     func showSending() {
+        captureVersion(reason: "app.before-delivery")
         isWaitingForFinalTranscript = false
         acceptsTranscriptUpdates = false
         cancelSettleTimer()
         statusLabel.stringValue = "识别完成，正在同步到 Mac mini…"
         statusLabel.textColor = .secondaryLabelColor
         textView.isEditable = false
+        updateSaveStatus()
         window?.makeFirstResponder(nil)
     }
 
@@ -192,6 +248,7 @@ final class ComposerPanelController: NSWindowController, NSTextViewDelegate {
         statusLabel.stringValue = message
         statusLabel.textColor = .systemRed
         textView.isEditable = true
+        updateSaveStatus()
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(textView)
     }
@@ -204,14 +261,100 @@ final class ComposerPanelController: NSWindowController, NSTextViewDelegate {
     }
 
     func hide() {
+        captureVersion(reason: "app.hide")
         isWaitingForFinalTranscript = false
         acceptsTranscriptUpdates = false
         cancelSettleTimer()
         window?.orderOut(nil)
+        updateSaveStatus()
     }
 
     func currentText() -> String {
         textView.string
+    }
+
+    func saveForTermination() {
+        captureVersion(reason: "app.termination")
+        history.flush()
+    }
+
+    @objc func showHistory() {
+        captureVersion(reason: "app.open-history")
+        if historyController == nil {
+            let controller = InputHistoryController(journal: history)
+            controller.canRestore = { [weak self] in self?.acceptsTranscriptUpdates == true }
+            controller.onRestore = { [weak self] version in self?.restoreVersion(version) ?? false }
+            historyController = controller
+        }
+        historyController?.present()
+    }
+
+    @objc func restorePreviousVersion() {
+        guard acceptsTranscriptUpdates else { return }
+        captureVersion(reason: "app.before-restore")
+        do {
+            guard let version = try history.previousNonempty(before: rollbackCursor, excluding: textView.string) else {
+                statusLabel.stringValue = "没有更早的非空版本；可在输入历史中选择其他记录"
+                return
+            }
+            _ = restoreVersion(version)
+            rollbackCursor = version.id
+        } catch { saveLabel.stringValue = "读取历史失败，现有记录未被清理" }
+    }
+
+    @discardableResult
+    private func restoreVersion(_ version: InputVersion) -> Bool {
+        guard acceptsTranscriptUpdates else { return false }
+        captureVersion(reason: "app.before-restore")
+        isRestoring = true
+        mutationReasons.append("app.restore")
+        defer { mutationReasons.removeLast(); isRestoring = false }
+        textView.inputContext?.discardMarkedText()
+        textView.unmarkText()
+        textView.string = version.text
+        textView.setSelectedRange(NSRange(location: textView.string.utf16.count, length: 0))
+        captureVersion(reason: "app.restore")
+        becameEmpty = false
+        statusLabel.stringValue = "已恢复 \(version.characterCount) 字。请检查文字，再按回车粘贴"
+        updateSaveStatus()
+        activate()
+        return true
+    }
+
+    private func captureVersion(reason: String) {
+        guard hasSession else { return }
+        let text = textView.string
+        let previousCount = lastObservedText.count
+        let actualReason = isRestoring ? "app.restore" : reason
+        let recorded = history.record(sessionID: sessionID, text: text, marked: textView.hasMarkedText(), reason: actualReason)
+        if recorded {
+            if !isRestoring { rollbackCursor = nil }
+            if previousCount > 0, text.isEmpty, !actualReason.hasPrefix("app.") {
+                becameEmpty = true
+                logger.error("Input became empty session=\(self.shortSessionID, privacy: .public) previousCharacters=\(previousCount) origin=\(actualReason, privacy: .public)")
+            } else if !text.isEmpty { becameEmpty = false }
+            logger.notice("Input version captured session=\(self.shortSessionID, privacy: .public) characters=\(text.count) marked=\(self.textView.hasMarkedText()) origin=\(actualReason, privacy: .public) durable=\(!self.history.hasUnsavedVersions)")
+        }
+        lastObservedText = text
+        updateSaveStatus()
+    }
+
+    private func updateSaveStatus() {
+        let title = "输入历史（\(history.count)/10版）"
+        if historyButton.title != title { historyButton.title = title }
+        let enabled = acceptsTranscriptUpdates && history.count > 0
+        if recoveryButton.isEnabled != enabled { recoveryButton.isEnabled = enabled }
+        let color: NSColor = history.lastError == nil ? .secondaryLabelColor : .systemRed
+        if saveLabel.textColor != color { saveLabel.textColor = color }
+        let message: String
+        if history.lastError != nil {
+            message = "本机保存失败，版本暂存内存；请先复制重要文字"
+        } else if becameEmpty {
+            message = "清空前的版本已保存，点击“恢复上一版”可找回"
+        } else {
+            message = "已保留 \(history.count)/10 版 · 本次 \(textView.string.count) 字"
+        }
+        if saveLabel.stringValue != message { saveLabel.stringValue = message }
     }
 
     var isReadyForLocalDictation: Bool {
@@ -224,6 +367,7 @@ final class ComposerPanelController: NSWindowController, NSTextViewDelegate {
     }
 
     func textDidChange(_ notification: Notification) {
+        captureVersion(reason: mutationReasons.last ?? "text-change")
         lastTextChangeAt = Date()
         let length = textView.string.utf16.count
         let marked = textView.hasMarkedText()
@@ -273,6 +417,7 @@ final class ComposerPanelController: NSWindowController, NSTextViewDelegate {
         textView.textColor = .labelColor
         textView.backgroundColor = .textBackgroundColor
         textView.isRichText = false
+        textView.allowsUndo = true
         textView.setAccessibilityLabel("远端输入内容")
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
@@ -282,6 +427,16 @@ final class ComposerPanelController: NSWindowController, NSTextViewDelegate {
         textView.onControlReleased = { [weak self] in
             guard let self, self.mode == .automatic else { return }
             self.onControlReleased?()
+        }
+        textView.onBeforeInputMutation = { [weak self] reason in
+            guard let self else { return }
+            self.captureVersion(reason: "before.\(reason)")
+            self.mutationReasons.append(reason)
+        }
+        textView.onAfterInputMutation = { [weak self] reason in
+            guard let self else { return }
+            self.captureVersion(reason: reason)
+            if !self.mutationReasons.isEmpty { self.mutationReasons.removeLast() }
         }
 
         ComposerTextLayout.attach(textView, to: scrollView)
@@ -294,6 +449,15 @@ final class ComposerPanelController: NSWindowController, NSTextViewDelegate {
         content.addSubview(targetLabel)
         content.addSubview(statusLabel)
         content.addSubview(scrollView)
+        recoveryButton.target = self
+        recoveryButton.action = #selector(restorePreviousVersion)
+        historyButton.target = self
+        historyButton.action = #selector(showHistory)
+        saveLabel.font = .systemFont(ofSize: 11)
+        let footer = NSStackView(views: [recoveryButton, historyButton, saveLabel])
+        footer.spacing = 10
+        footer.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(footer)
 
         NSLayoutConstraint.activate([
             icon.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 18),
@@ -312,7 +476,11 @@ final class ComposerPanelController: NSWindowController, NSTextViewDelegate {
             scrollView.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 18),
             scrollView.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -18),
             scrollView.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 10),
-            scrollView.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16)
+            scrollView.bottomAnchor.constraint(equalTo: footer.topAnchor, constant: -12),
+            footer.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 18),
+            footer.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -18),
+            footer.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -14),
+            footer.heightAnchor.constraint(greaterThanOrEqualToConstant: 28)
         ])
     }
 

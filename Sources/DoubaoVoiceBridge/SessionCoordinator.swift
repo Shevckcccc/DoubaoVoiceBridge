@@ -19,6 +19,8 @@ protocol DictationComposer: AnyObject {
     func showWaitingForClipboard()
     func showError(_ message: String)
     func currentText() -> String
+    func showHistory()
+    func saveForTermination()
 }
 
 extension ComposerPanelController: DictationComposer {}
@@ -113,9 +115,12 @@ final class SessionCoordinator {
     }
 
     func prepareForTermination() {
+        panel.saveForTermination()
         ClipboardKeyboardPaster.finishPendingEventsBeforeTermination()
         delivery.restoreClipboardForTermination()
     }
+
+    func showInputHistory() { panel.showHistory() }
 
     private func send(text: String) {
         guard state == .listening || state == .finalizing || state == .failed,

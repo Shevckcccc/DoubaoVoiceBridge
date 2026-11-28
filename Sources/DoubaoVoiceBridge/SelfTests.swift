@@ -569,8 +569,10 @@ enum SelfTests {
             shortcut.stop()
         }
 
+        failures.append(contentsOf: InputHistorySelfTests.run())
+
         if failures.isEmpty {
-            print("SELF_TEST_OK groups=21 (standalone Control timer + manual confirmation + IME composition + routing)")
+            print("SELF_TEST_OK groups=28 (incremental ten-version history + legacy compaction + loss recovery + abrupt exit + IME editor)")
             return true
         }
         for failure in failures {
@@ -597,6 +599,8 @@ private final class TestDictationComposer: DictationComposer {
     func showWaitingForClipboard() {}
     func showError(_ message: String) {}
     func currentText() -> String { "" }
+    func showHistory() {}
+    func saveForTermination() {}
 }
 
 private final class TestTranscriptDelivery: TranscriptDelivery {

@@ -3,6 +3,9 @@ import AppKit
 @main
 enum DoubaoVoiceBridgeMain {
     static func main() {
+        if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--history-crash-test" {
+            InputHistorySelfTests.crashWriter(path: CommandLine.arguments[2])
+        }
         if CommandLine.arguments.contains("--diagnostics") {
             Diagnostics.printReport()
             return

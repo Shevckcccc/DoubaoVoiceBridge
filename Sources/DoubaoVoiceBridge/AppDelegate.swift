@@ -140,6 +140,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         manual.target = self
         menu.addItem(manual)
 
+        let history = NSMenuItem(title: "输入历史与恢复…", action: #selector(showInputHistory), keyEquivalent: "")
+        history.target = self
+        menu.addItem(history)
+
         let permissions = NSMenuItem(title: "检查 / 开启所需权限…", action: #selector(openPermissions), keyEquivalent: "")
         permissions.target = self
         menu.addItem(permissions)
@@ -201,6 +205,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func openPermissions() {
         requestRequiredPermissions(forceOpenSettings: true)
     }
+
+    @objc private func showInputHistory() { coordinator.showInputHistory() }
 
     private func requestRequiredPermissions(forceOpenSettings: Bool = false) {
         let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
